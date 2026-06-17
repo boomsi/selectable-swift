@@ -67,9 +67,9 @@ const SELECTABLE_TEXT_COMMANDS = {
   copyRange: 'copyRange',
 } as const;
 
-// 只在 iOS 上使用原生 SelectableText。
+// iOS 和 Android 都使用同名原生 SelectableText，其他平台保留 RN Text fallback。
 const NativeSelectableText =
-  Platform.OS === 'ios'
+  Platform.OS === 'ios' || Platform.OS === 'android'
     ? requireNativeComponent<NativeSelectableTextProps>('SelectableText')
     : null;
 
@@ -188,8 +188,8 @@ const SelectableText = React.forwardRef<SelectableTextRef, NativeSelectableTextP
     );
   }
 
-  // 非 iOS 平台使用 RN Text 自带 selectable 能力，不接入 iOS 原生自定义菜单。
-  if (Platform.OS !== 'ios' || !NativeSelectableText) {
+  // 未注册原生 SelectableText 的平台使用 RN Text 自带 selectable 能力。
+  if (!NativeSelectableText) {
     return (
       <Text selectable={selectable} style={style}>
         {children}

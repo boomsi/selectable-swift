@@ -11,6 +11,7 @@ import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.facebook.react.defaults.DefaultReactNativeHost
 import com.facebook.react.soloader.OpenSourceMergedSoMapping
 import com.facebook.soloader.SoLoader
+import com.selectableapp.selectabletext.SelectableTextPackage
 
 class MainApplication : Application(), ReactApplication {
 
@@ -20,6 +21,8 @@ class MainApplication : Application(), ReactApplication {
             PackageList(this).packages.apply {
               // Packages that cannot be autolinked yet can be added manually here, for example:
               // add(MyReactNativePackage())
+              // 手动注册 SelectableText Android 原生组件，让 requireNativeComponent('SelectableText') 可解析。
+              add(SelectableTextPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"
