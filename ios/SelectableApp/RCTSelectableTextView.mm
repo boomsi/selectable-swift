@@ -15,6 +15,8 @@ static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
   BOOL _rnSelectable;
   UILongPressGestureRecognizer *_paragraphLongPressGestureRecognizer;
   UIEditMenuInteraction *_selectionEditMenuInteraction API_AVAILABLE(ios(16.0));
+  // 递增的选区折叠检查标记，用于让新的选区变化取消旧的延迟恢复任务。
+  NSUInteger _collapsedSelectionResetToken;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -100,10 +102,61 @@ static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
   return [super becomeFirstResponder];
 }
 
+// UIKit 自行把选区折叠为空时，把业务菜单模式恢复成不可直接双击选中的初始态。
+- (void)textViewDidChangeSelection:(UITextView *)textView
+{
+  // 只在 RN 菜单后选段落模式处理，避免影响默认原生选择模式。
+  if (![self isMenuThenParagraphMode]) {
+    return;
+  }
+
+  // 有实际选区时取消之前的折叠恢复任务，避免拖动控制手柄时被旧任务打断。
+  if (self.selectedRange.location != NSNotFound && self.selectedRange.length > 0) {
+    _collapsedSelectionResetToken++;
+    return;
+  }
+
+  [self scheduleCollapsedSelectionResetForMenuThenParagraphMode];
+}
+
 // 判断当前是否使用 RN 菜单后再选段落的业务模式。
 - (BOOL)isMenuThenParagraphMode
 {
   return [self.selectionMode isEqualToString:@"menuThenParagraph"];
+}
+
+// 延迟确认选区仍为空后再关闭 native selectable，避免和 UIKit 手柄拖动中的中间状态冲突。
+- (void)scheduleCollapsedSelectionResetForMenuThenParagraphMode
+{
+  _collapsedSelectionResetToken++;
+  NSUInteger resetToken = _collapsedSelectionResetToken;
+  __weak RCTSelectableTextView *weakSelf = self;
+
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    RCTSelectableTextView *strongSelf = weakSelf;
+
+    // 视图已释放时不再执行延迟恢复。
+    if (strongSelf == nil) {
+      return;
+    }
+
+    // 模式已经切换时不再处理，避免影响 default 选择行为。
+    if (![strongSelf isMenuThenParagraphMode]) {
+      return;
+    }
+
+    // 期间发生过新的选区变化时放弃旧任务，避免覆盖用户正在调整的选区。
+    if (resetToken != strongSelf->_collapsedSelectionResetToken) {
+      return;
+    }
+
+    // 延迟后如果已经重新出现实际选区，说明用户仍在调整手柄，不关闭选择能力。
+    if (strongSelf.selectedRange.location != NSNotFound && strongSelf.selectedRange.length > 0) {
+      return;
+    }
+
+    [strongSelf clearTextSelection];
+  });
 }
 
 // 根据 selectable 和 selectionMode 同步 UITextView 的真实可选状态。

@@ -3,11 +3,6 @@
 ## 概述
 创建一个基于 Android TextView / ReactTextView 的 RN（旧架构）原生组件 SelectableText，实现 Android 原生级别的文本选取体验（高亮 + 手柄 + ActionMode 菜单），并尽量复用 RN Text 的 Spannable 构建和 Yoga 测量链路。
 
-注意：下面的逻辑是先做的长按选中，然后做的先长按弹出 rn 菜单，点击菜单选项再选中；
-先实现长按选中；先不做 长按弹出 rn 菜单，点击菜单再选中的逻辑；
-
----
-
 ## 步骤
 
 ### 1. 创建 SelectableTextView（原生视图）
@@ -122,7 +117,7 @@
 
 --- 
 
-### 1. 间接选中
+### 13. 间接选中
 - 长按出现自定义菜单，点击菜单项后再选中文本
 - 评估 Android TextView 是否允许先展示菜单再进入 selection ActionMode
 - 如果系统能力不稳定，优先保持原生长按选中流程，再追加自定义菜单项

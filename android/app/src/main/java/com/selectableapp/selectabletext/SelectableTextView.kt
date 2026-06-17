@@ -3,19 +3,27 @@ package com.selectableapp.selectabletext
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Rect
+import android.os.Bundle
 import android.text.Selection
 import android.text.Spannable
 import android.view.ActionMode
+import android.view.GestureDetector
 import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.TextView
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactContext
+import com.facebook.react.bridge.WritableMap
+import com.facebook.react.uimanager.PixelUtil
 import com.facebook.react.uimanager.events.RCTEventEmitter
 import com.facebook.react.views.text.ReactTextView
 import java.lang.ref.WeakReference
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 // SelectableTextMenuItem 保存 JS 传入的 ActionMode 自定义菜单项。
 data class SelectableTextMenuItem(val id: String, val title: String)
@@ -39,15 +47,36 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
   // clearSelectionOnMenuAction 控制自定义菜单点击后是否自动清空当前选区。
   var clearSelectionOnMenuAction: Boolean = false
 
-  // selectionMode 保留 JS/iOS 同名 API；Android 当前先实现原生长按选区主流程。
+  // selectionMode 控制长按直接进入系统选区，还是先回调 JS 展示 RN 段落菜单。
   var selectionMode: String = SELECTION_MODE_DEFAULT
+    set(value) {
+      field = value
+      updateNativeSelectableState()
+    }
 
   // currentActionMode 记录当前浮动菜单，用于属性更新、清理选区和释放父级手势拦截。
   private var currentActionMode: ActionMode? = null
 
-  // selectionActionModeCallback 统一处理系统菜单保留策略、自定义菜单和 JS 回调。
+  // rnSelectable 保存 JS selectable prop 的值，selectionMode 会基于它计算真实原生可选状态。
+  private var rnSelectable: Boolean = true
+
+  // paragraphLongPressDetector 在 menuThenParagraph 模式下只负责命中段落并通知 JS。
+  private val paragraphLongPressDetector =
+      GestureDetector(
+          context,
+          object : GestureDetector.SimpleOnGestureListener() {
+            // onDown 返回 true，保证后续 onLongPress 能收到同一轮触摸事件。
+            override fun onDown(event: MotionEvent): Boolean = true
+
+            // onLongPress 只在业务菜单模式下触发 RN 段落菜单，不直接进入 TextView 选区。
+            override fun onLongPress(event: MotionEvent) {
+              handleParagraphLongPress(event)
+            }
+          })
+
+  // selectionActionModeCallback 统一处理系统菜单保留策略、自定义菜单、菜单定位和 JS 回调。
   private val selectionActionModeCallback =
-      object : ActionMode.Callback {
+      object : ActionMode.Callback2() {
         // onCreateActionMode 在 Android 进入文本选择菜单时初始化菜单内容。
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
           currentActionMode = mode
@@ -85,6 +114,12 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
         override fun onDestroyActionMode(mode: ActionMode) {
           currentActionMode = null
           parent?.requestDisallowInterceptTouchEvent(false)
+          restoreMenuThenParagraphTouchStateAfterActionMode()
+        }
+
+        // onGetContentRect 把浮动菜单锚点绑定到当前选区首行，而不是整个 SelectableText 视图。
+        override fun onGetContentRect(mode: ActionMode, view: android.view.View, outRect: Rect) {
+          selectedTextContentRect(outRect)
         }
       }
 
@@ -96,7 +131,8 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
 
   // setTextIsSelectable 接收 RN selectable prop，并同步到底层 Android TextView。
   override fun setTextIsSelectable(selectable: Boolean) {
-    super.setTextIsSelectable(selectable)
+    rnSelectable = selectable
+    updateNativeSelectableState()
   }
 
   // onTouchEvent 在不同 SelectableText 之间切换时清理旧选区，并在拖动手柄时保护父级手势。
@@ -104,6 +140,20 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     // ACTION_DOWN 表示用户开始和当前文本块交互，需要清掉上一个文本块的残留选区。
     if (event.actionMasked == MotionEvent.ACTION_DOWN) {
       markAsActiveSelectableTextView()
+    }
+
+    // menuThenParagraph 未选中时长按只弹 RN 菜单；已有选区时交还 TextView 处理手柄拖动。
+    if (isMenuThenParagraphMode() && !hasActiveSelection()) {
+      paragraphLongPressDetector.onTouchEvent(event)
+
+      // 手指抬起或取消时释放父级拦截限制，普通上下滑动仍交给 ScrollView 判断。
+      if (
+          event.actionMasked == MotionEvent.ACTION_UP ||
+              event.actionMasked == MotionEvent.ACTION_CANCEL) {
+        parent?.requestDisallowInterceptTouchEvent(false)
+      }
+
+      return true
     }
 
     // 当前文本已经有选区时，后续拖动通常是选择手柄移动，不应被 ScrollView 抢走。
@@ -146,25 +196,27 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
 
     currentActionMode?.finish()
     clearFocus()
+    updateNativeSelectableState()
     parent?.requestDisallowInterceptTouchEvent(false)
     invalidate()
   }
 
-  // selectRange 根据 JS 命令设置文本选区；Android 主路径仍是用户长按进入原生选择。
+  // selectRange 根据 JS 菜单命令临时开启原生选择能力，并设置指定段落选区。
   fun selectRange(start: Int, end: Int) {
-    val currentText = text
-    val range = clampedRange(start, end, currentText.length)
+    markAsActiveSelectableTextView()
+    super.setTextIsSelectable(true)
 
-    // range 无效或文本不是 Spannable 时，不能安全写入 Selection span。
-    if (range == null || currentText !is Spannable) {
+    val selectableText = ensureSpannableText()
+    val range = clampedRange(start, end, selectableText?.length ?: 0)
+
+    // range 无效或文本无法转成 Spannable 时，不能安全写入 Selection span。
+    if (range == null || selectableText == null) {
       return
     }
 
-    markAsActiveSelectableTextView()
-    requestFocus()
-    Selection.setSelection(currentText, range.first, range.second)
+    requestFocusFromTouch()
     parent?.requestDisallowInterceptTouchEvent(true)
-    invalidate()
+    setSelectionThroughTextViewAction(range)
   }
 
   // copyRange 根据 JS 命令复制指定范围文本到 Android 剪贴板。
@@ -234,12 +286,7 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
       putInt("selectionEnd", normalizedEnd)
     }
 
-    // 只有 ReactContext 才能发送 RN 旧架构 direct event。
-    if (context is ReactContext) {
-      (context as ReactContext)
-          .getJSModule(RCTEventEmitter::class.java)
-          .receiveEvent(id, EVENT_MENU_ACTION, event)
-    }
+    emitDirectEvent(EVENT_MENU_ACTION, event)
   }
 
   // invalidateActionMode 在菜单相关 props 更新时请求 Android 刷新当前 ActionMode。
@@ -247,6 +294,181 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     // 只有已有 ActionMode 时才需要刷新菜单，未选中文本时无需做任何 UI 更新。
     if (currentActionMode != null) {
       currentActionMode?.invalidate()
+    }
+  }
+
+  // ensureSpannableText 确保 Android Selection 能写入当前 TextView 文本 buffer。
+  private fun ensureSpannableText(): Spannable? {
+    val currentText = text
+
+    // 已经是 Spannable 时可以直接写 Selection span。
+    if (currentText is Spannable) {
+      return currentText
+    }
+
+    // 普通 SpannedString 需要切换成 SPANNABLE buffer，否则 Selection.setSelection 不会生效。
+    setText(currentText, TextView.BufferType.SPANNABLE)
+
+    val updatedText = text
+
+    // Android TextView 理论上会返回 Spannable；如果系统实现异常，则调用方不继续选区操作。
+    if (updatedText !is Spannable) {
+      return null
+    }
+
+    return updatedText
+  }
+
+  // setSelectionThroughTextViewAction 使用 TextView 的公开无障碍选区动作，同时触发系统 selection mode。
+  private fun setSelectionThroughTextViewAction(selectionRange: Pair<Int, Int>) {
+    val arguments = Bundle().apply {
+      putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, selectionRange.first)
+      putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, selectionRange.second)
+    }
+
+    // ACTION_SET_SELECTION 内部会调用 TextView 的 startSelectionActionModeAsync，创建系统菜单和手柄。
+    performAccessibilityAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, arguments)
+  }
+
+  // isMenuThenParagraphMode 判断当前是否使用“先弹 RN 菜单，再选中段落”的业务模式。
+  private fun isMenuThenParagraphMode(): Boolean = selectionMode == SELECTION_MODE_MENU_THEN_PARAGRAPH
+
+  // updateNativeSelectableState 根据 selectable 和 selectionMode 同步 Android TextView 真实可选状态。
+  private fun updateNativeSelectableState() {
+    super.setTextIsSelectable(if (isMenuThenParagraphMode()) false else rnSelectable)
+  }
+
+  // restoreMenuThenParagraphTouchStateAfterActionMode 在系统选区关闭后恢复 RN 菜单优先的长按状态。
+  private fun restoreMenuThenParagraphTouchStateAfterActionMode() {
+    // 只在 menuThenParagraph 模式下恢复，默认模式仍保留 Android TextView 的原生可选行为。
+    if (!isMenuThenParagraphMode()) {
+      return
+    }
+
+    post {
+      updateNativeSelectableState()
+      clearFocus()
+    }
+  }
+
+  // handleParagraphLongPress 计算长按命中的段落范围，并把菜单定位信息回传给 JS。
+  private fun handleParagraphLongPress(event: MotionEvent) {
+    // 非业务菜单模式不处理段落长按，避免干扰默认原生选区流程。
+    if (!isMenuThenParagraphMode()) {
+      return
+    }
+
+    markAsActiveSelectableTextView()
+    clearSelection()
+
+    val paragraphRange = paragraphRangeAtPoint(event.x, event.y)
+
+    // 没有命中文本时不弹 RN 菜单，避免空白区域长按产生无效菜单。
+    if (paragraphRange == null) {
+      return
+    }
+
+    val windowLocation = IntArray(2)
+    getLocationInWindow(windowLocation)
+    val pageX = windowLocation[0].toFloat() + event.x
+    val pageY = windowLocation[1].toFloat() + event.y
+    val eventPayload = Arguments.createMap().apply {
+      putString(
+          "paragraphText",
+          text.subSequence(paragraphRange.first, paragraphRange.second).toString())
+      putInt("selectionStart", paragraphRange.first)
+      putInt("selectionEnd", paragraphRange.second)
+      putDouble("locationX", PixelUtil.toDIPFromPixel(event.x).toDouble())
+      putDouble("locationY", PixelUtil.toDIPFromPixel(event.y).toDouble())
+      putDouble("pageX", PixelUtil.toDIPFromPixel(pageX).toDouble())
+      putDouble("pageY", PixelUtil.toDIPFromPixel(pageY).toDouble())
+    }
+
+    parent?.requestDisallowInterceptTouchEvent(true)
+    emitDirectEvent(EVENT_TEXT_LONG_PRESS, eventPayload)
+  }
+
+  // selectedTextContentRect 计算当前选区首行在 TextView 内部坐标系里的矩形，用于系统菜单定位。
+  private fun selectedTextContentRect(outRect: Rect) {
+    val currentLayout = layout
+    val selectionStart = Selection.getSelectionStart(text)
+    val selectionEnd = Selection.getSelectionEnd(text)
+    val normalizedStart = min(selectionStart, selectionEnd)
+    val normalizedEnd = max(selectionStart, selectionEnd)
+
+    // 没有布局或有效选区时，返回空 rect，让系统使用自己的默认定位。
+    if (currentLayout == null || normalizedStart < 0 || normalizedEnd <= normalizedStart) {
+      outRect.setEmpty()
+      return
+    }
+
+    val line = currentLayout.getLineForOffset(normalizedStart)
+    val lineSelectionEnd = min(normalizedEnd, currentLayout.getLineEnd(line))
+    val startX = currentLayout.getPrimaryHorizontal(normalizedStart)
+    val endX = currentLayout.getPrimaryHorizontal(lineSelectionEnd)
+    val left = min(startX, endX) + totalPaddingLeft - scrollX
+    val right = max(startX, endX) + totalPaddingLeft - scrollX
+    val top = currentLayout.getLineTop(line).toFloat() + totalPaddingTop - scrollY
+    val bottom = currentLayout.getLineBottom(line).toFloat() + totalPaddingTop - scrollY
+
+    outRect.set(left.roundToInt(), top.roundToInt(), right.roundToInt(), bottom.roundToInt())
+  }
+
+  // paragraphRangeAtPoint 把长按坐标映射到字符 index，并按换行切出所在段落。
+  private fun paragraphRangeAtPoint(x: Float, y: Float): Pair<Int, Int>? {
+    val layout = layout
+    val currentText = text
+
+    // 文本或布局为空时没有可命中的段落。
+    if (currentText.isEmpty() || layout == null) {
+      return null
+    }
+
+    val contentX = x - totalPaddingLeft + scrollX
+    val contentY = y - totalPaddingTop + scrollY
+
+    // 点击在文本布局垂直范围外时不返回段落。
+    if (contentY < 0 || contentY > layout.height) {
+      return null
+    }
+
+    val line = layout.getLineForVertical(contentY.toInt())
+
+    // 点击在当前行文字左右范围外时不返回段落，避免空白区域误触发。
+    if (contentX < layout.getLineLeft(line) || contentX > layout.getLineRight(line)) {
+      return null
+    }
+
+    val charIndex = layout.getOffsetForHorizontal(line, contentX)
+    val safeCharIndex = min(charIndex, currentText.length - 1)
+    var start = safeCharIndex
+    var end = safeCharIndex
+
+    // 向前找到当前段落的换行边界。
+    while (start > 0 && currentText[start - 1] != '\n') {
+      start--
+    }
+
+    // 向后找到当前段落的换行边界。
+    while (end < currentText.length && currentText[end] != '\n') {
+      end++
+    }
+
+    // 长按命中空行时不返回段落。
+    if (end <= start) {
+      return null
+    }
+
+    return start to end
+  }
+
+  // emitDirectEvent 通过 RN 旧架构事件通道发送 SelectableText 的 direct event。
+  private fun emitDirectEvent(eventName: String, eventPayload: WritableMap) {
+    // 只有 ReactContext 才能发送 RN 旧架构 direct event。
+    if (context is ReactContext) {
+      (context as ReactContext)
+          .getJSModule(RCTEventEmitter::class.java)
+          .receiveEvent(id, eventName, eventPayload)
     }
   }
 
@@ -273,11 +495,14 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     // EVENT_MENU_ACTION 是 Android 发送给 JS onMenuAction 的 direct event 名。
     const val EVENT_MENU_ACTION = "topMenuAction"
 
-    // EVENT_TEXT_LONG_PRESS 仅注册给 JS/iOS 同名 API；Android 当前不实现间接选中长按菜单。
+    // EVENT_TEXT_LONG_PRESS 是 Android 命中段落后发送给 JS RN 菜单的 direct event 名。
     const val EVENT_TEXT_LONG_PRESS = "topTextLongPress"
 
     // SELECTION_MODE_DEFAULT 是 Android 当前实现的原生长按选区模式。
     const val SELECTION_MODE_DEFAULT = "default"
+
+    // SELECTION_MODE_MENU_THEN_PARAGRAPH 是先通知 JS 弹菜单，再由菜单命令选中段落的模式。
+    private const val SELECTION_MODE_MENU_THEN_PARAGRAPH = "menuThenParagraph"
 
     // CLIP_LABEL 是写入 Android 剪贴板时使用的来源标签。
     private const val CLIP_LABEL = "SelectableText"
