@@ -1,5 +1,8 @@
 import React from 'react';
 import {
+  findNodeHandle,
+  NativeModules,
+  UIManager,
   NativeSyntheticEvent,
   requireNativeComponent,
   StyleProp,
@@ -23,6 +26,24 @@ interface SelectableTextMenuActionEvent {
   selectionEnd: number;
 }
 
+interface SelectableTextLongPressEvent {
+  paragraphText: string;
+  selectionStart: number;
+  selectionEnd: number;
+  locationX: number;
+  locationY: number;
+  pageX: number;
+  pageY: number;
+}
+
+type SelectableTextSelectionMode = 'default' | 'menuThenParagraph';
+
+interface SelectableTextRef {
+  selectRange: (start: number, end: number) => void;
+  clearSelection: () => void;
+  copyRange: (start: number, end: number) => void;
+}
+
 interface NativeSelectableTextProps {
   selectable?: boolean;
   style?: StyleProp<TextStyle>;
@@ -30,10 +51,21 @@ interface NativeSelectableTextProps {
   menuItems?: SelectableTextMenuItem[];
   showSystemMenuItems?: boolean;
   clearSelectionOnMenuAction?: boolean;
+  selectionMode?: SelectableTextSelectionMode;
   onMenuAction?: (
     event: NativeSyntheticEvent<SelectableTextMenuActionEvent>,
   ) => void;
+  onTextLongPress?: (
+    event: NativeSyntheticEvent<SelectableTextLongPressEvent>,
+  ) => void;
 }
+
+// SelectableText 原生命令名称，和 RCTSelectableTextViewManager 导出的 command 保持一致。
+const SELECTABLE_TEXT_COMMANDS = {
+  selectRange: 'selectRange',
+  clearSelection: 'clearSelection',
+  copyRange: 'copyRange',
+} as const;
 
 // 只在 iOS 上使用原生 SelectableText。
 const NativeSelectableText =
@@ -84,15 +116,71 @@ function containsUnsupportedViewChild(children: React.ReactNode): boolean {
   return hasUnsupportedView;
 }
 
-function SelectableText({
-  selectable = true,
-  style,
-  children,
-  menuItems,
-  showSystemMenuItems = true,
-  clearSelectionOnMenuAction = false,
-  onMenuAction,
-}: NativeSelectableTextProps): React.JSX.Element {
+function dispatchSelectableTextCommand(
+  nativeRef: React.RefObject<any>,
+  command: (typeof SELECTABLE_TEXT_COMMANDS)[keyof typeof SELECTABLE_TEXT_COMMANDS],
+  args: unknown[] = [],
+) {
+  const nativeTag = findNodeHandle(nativeRef.current);
+
+  // nativeTag 为空时说明原生视图尚未挂载，不能发送命令。
+  if (nativeTag == null) {
+    return;
+  }
+
+  const nativeSelectableTextManager = NativeModules.SelectableText;
+
+  // 优先直接调用 ViewManager 导出的 native method，避免旧架构 command 名称映射不一致。
+  if (typeof nativeSelectableTextManager?.[command] === 'function') {
+    nativeSelectableTextManager[command](nativeTag, ...args);
+    return;
+  }
+
+  // 兜底走 UIManager command 通道，兼容只暴露 command config 的运行环境。
+  UIManager.dispatchViewManagerCommand(nativeTag, command, args);
+}
+
+const SelectableText = React.forwardRef<SelectableTextRef, NativeSelectableTextProps>(
+  (
+    {
+      selectable = true,
+      style,
+      children,
+      menuItems,
+      showSystemMenuItems = true,
+      clearSelectionOnMenuAction = false,
+      selectionMode = 'default',
+      onMenuAction,
+      onTextLongPress,
+    },
+    ref,
+  ): React.JSX.Element => {
+    // 原生命令通过 findNodeHandle 定位 HostComponent，避免暴露底层 native view 类型。
+    const nativeRef = React.useRef<any>(null);
+
+    // 暴露给 RN 菜单调用的原生选区命令。
+    React.useImperativeHandle(
+      ref,
+      () => ({
+        selectRange: (start: number, end: number) => {
+          dispatchSelectableTextCommand(nativeRef, SELECTABLE_TEXT_COMMANDS.selectRange, [
+            start,
+            end,
+          ]);
+        },
+        clearSelection: () => {
+          dispatchSelectableTextCommand(nativeRef, SELECTABLE_TEXT_COMMANDS.clearSelection);
+        },
+        copyRange: (start: number, end: number) => {
+          dispatchSelectableTextCommand(nativeRef, SELECTABLE_TEXT_COMMANDS.copyRange, [
+            start,
+            end,
+          ]);
+        },
+      }),
+      [],
+    );
+
   // SelectableText 只允许文本子树，避免 View 进入原生层后变成不可拆分附件。
   if (containsUnsupportedViewChild(children)) {
     throw new Error(
@@ -113,18 +201,28 @@ function SelectableText({
   // 而非独立的 RCTText，这样文字才能合并到 RCTSelectableTextView 的 NSTextStorage 中
   return (
     <NativeSelectableText
+      ref={nativeRef}
       selectable={selectable}
       style={style}
       menuItems={menuItems}
       showSystemMenuItems={showSystemMenuItems}
       clearSelectionOnMenuAction={clearSelectionOnMenuAction}
-      onMenuAction={onMenuAction}>
+      selectionMode={selectionMode}
+      onMenuAction={onMenuAction}
+      onTextLongPress={onTextLongPress}>
       <TextAncestor.Provider value={true}>
         {children}
       </TextAncestor.Provider>
     </NativeSelectableText>
   );
-}
+  },
+);
 
 export default SelectableText;
-export type {SelectableTextMenuActionEvent, SelectableTextMenuItem};
+export type {
+  SelectableTextLongPressEvent,
+  SelectableTextMenuActionEvent,
+  SelectableTextMenuItem,
+  SelectableTextRef,
+  SelectableTextSelectionMode,
+};

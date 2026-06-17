@@ -1,97 +1,172 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# SelectableText 使用示例
 
-# Getting Started
+`SelectableText` 是一个 iOS 原生 `UITextView` 封装，用于支持富文本选区、系统手柄、选中后菜单，以及业务侧长按菜单。
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+## 基础用法
 
-## Step 1: Start Metro
+```tsx
+import React from 'react';
+import {Text} from 'react-native';
+import SelectableText from './src/components/SelectableText';
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
-
-To start the Metro dev server, run the following command from the root of your React Native project:
-
-```sh
-# Using npm
-npm start
-
-# OR using Yarn
-yarn start
+function Example() {
+  return (
+    <SelectableText selectable style={{fontSize: 16, lineHeight: 24}}>
+      <Text>普通文本</Text>
+      <Text style={{fontWeight: '700'}}>加粗文本</Text>
+    </SelectableText>
+  );
+}
 ```
 
-## Step 2: Build and run your app
+`SelectableText` 内部只允许文本子树，不要放 `View`。如果需要布局容器，把 `View` 放在 `SelectableText` 外面。
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+## RN 长按菜单 + 选中段落
 
-### Android
+`selectionMode="menuThenParagraph"` 下，长按不会直接选中文本。native 会计算长按位置所在段落，并把段落范围和菜单坐标回传给 RN。RN 渲染业务菜单，点击菜单项后再调用 ref 命令选中或复制段落。
 
-```sh
-# Using npm
-npm run android
+```tsx
+import React from 'react';
+import {Pressable, Text, View} from 'react-native';
+import SelectableText, {
+  type SelectableTextLongPressEvent,
+  type SelectableTextRef,
+} from './src/components/SelectableText';
 
-# OR using Yarn
-yarn android
+function ParagraphMenuExample() {
+  const textRef = React.useRef<SelectableTextRef>(null);
+  const [menu, setMenu] = React.useState<SelectableTextLongPressEvent | null>(
+    null,
+  );
+
+  return (
+    <View>
+      <SelectableText
+        ref={textRef}
+        selectionMode="menuThenParagraph"
+        onTextLongPress={({nativeEvent}) => {
+          setMenu(nativeEvent);
+        }}>
+        <Text>第一段文本</Text>
+        <Text>{'\n'}第二段文本</Text>
+      </SelectableText>
+
+      {menu && (
+        <View style={{position: 'absolute', left: menu.pageX, top: menu.pageY}}>
+          <Pressable
+            onPress={() => {
+              textRef.current?.selectRange(
+                menu.selectionStart,
+                menu.selectionEnd,
+              );
+              setMenu(null);
+            }}>
+            <Text>选取文本</Text>
+          </Pressable>
+
+          <Pressable
+            onPress={() => {
+              textRef.current?.copyRange(menu.selectionStart, menu.selectionEnd);
+              textRef.current?.clearSelection();
+              setMenu(null);
+            }}>
+            <Text>复制</Text>
+          </Pressable>
+        </View>
+      )}
+    </View>
+  );
+}
 ```
 
-### iOS
+段落按换行符 `\n` 分割。
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
+## 选中后的原生自定义菜单
 
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+点击 RN 菜单里的“选取文本”后，native 会设置 `selectedRange` 并显示 iOS 选区菜单。可以通过 `menuItems` 添加业务菜单项。
 
-```sh
-bundle install
+```tsx
+<SelectableText
+  ref={textRef}
+  selectionMode="menuThenParagraph"
+  menuItems={[
+    {id: 'quote', title: '引用'},
+    {id: 'explain', title: '解释'},
+  ]}
+  showSystemMenuItems={false}
+  clearSelectionOnMenuAction={true}
+  onMenuAction={({nativeEvent}) => {
+    console.log(nativeEvent.id, nativeEvent.selectedText);
+  }}
+  onTextLongPress={({nativeEvent}) => {
+    setMenu(nativeEvent);
+  }}>
+  <Text>这是一段可选中的文本</Text>
+</SelectableText>
 ```
 
-Then, and every time you update your native dependencies, run:
+- `showSystemMenuItems={false}`：只显示业务菜单项，不显示系统复制/全选等菜单。
+- `clearSelectionOnMenuAction={true}`：点击选中后的原生菜单项后自动清空选区。
 
-```sh
-bundle exec pod install
+## FlatList 推荐写法
+
+列表里不需要在父组件维护所有 `SelectableText` 的 ref。每个 item 自己创建 ref，长按时只把当前 item 的 ref 和 range 交给父级菜单状态。
+
+```tsx
+import React from 'react';
+import {FlatList, Pressable, Text} from 'react-native';
+import SelectableText, {
+  type SelectableTextLongPressEvent,
+  type SelectableTextRef,
+} from './src/components/SelectableText';
+
+function Row({item, onTextLongPress}: any) {
+  const textRef = React.useRef<SelectableTextRef>(null);
+
+  return (
+    <SelectableText
+      ref={textRef}
+      selectionMode="menuThenParagraph"
+      onTextLongPress={({nativeEvent}) => {
+        onTextLongPress({
+          textRef,
+          itemId: item.id,
+          ...nativeEvent,
+        });
+      }}>
+      <Text>{item.content}</Text>
+    </SelectableText>
+  );
+}
+
+function ListExample({data}: {data: Array<{id: string; content: string}>}) {
+  const [menu, setMenu] = React.useState<any>(null);
+
+  return (
+    <>
+      <FlatList
+        data={data}
+        keyExtractor={item => item.id}
+        renderItem={({item}) => (
+          <Row item={item} onTextLongPress={setMenu} />
+        )}
+      />
+
+      {menu && (
+        <Pressable
+          onPress={() => {
+            menu.textRef.current?.selectRange(
+              menu.selectionStart,
+              menu.selectionEnd,
+            );
+            setMenu(null);
+          }}>
+          <Text>选取文本</Text>
+        </Pressable>
+      )}
+    </>
+  );
+}
 ```
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
-npm run ios
-
-# OR using Yarn
-yarn ios
-```
-
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
-
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
-
-## Step 3: Modify your app
-
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+这种方式父级只保存当前长按的 item，不保存整个列表的 ref。

@@ -78,5 +78,49 @@ RCT_EXPORT_VIEW_PROPERTY(menuItems, NSArray)
 RCT_EXPORT_VIEW_PROPERTY(showSystemMenuItems, BOOL)
 RCT_EXPORT_VIEW_PROPERTY(clearSelectionOnMenuAction, BOOL)
 RCT_EXPORT_VIEW_PROPERTY(onMenuAction, RCTDirectEventBlock)
+RCT_EXPORT_VIEW_PROPERTY(selectionMode, NSString)
+RCT_EXPORT_VIEW_PROPERTY(onTextLongPress, RCTDirectEventBlock)
+
+RCT_EXPORT_METHOD(selectRange : (nonnull NSNumber *)reactTag start : (NSInteger)start end : (NSInteger)end)
+{
+  [self.bridge.uiManager addUIBlock:^(__unused RCTUIManager *uiManager, NSDictionary<NSNumber *, UIView *> *viewRegistry) {
+    RCTSelectableTextView *view = (RCTSelectableTextView *)viewRegistry[reactTag];
+
+    // 只对 SelectableText 实例执行选区命令，避免错误 tag 影响其他原生视图。
+    if (![view isKindOfClass:[RCTSelectableTextView class]]) {
+      return;
+    }
+
+    [view selectTextRangeWithStart:start end:end];
+  }];
+}
+
+RCT_EXPORT_METHOD(clearSelection : (nonnull NSNumber *)reactTag)
+{
+  [self.bridge.uiManager addUIBlock:^(__unused RCTUIManager *uiManager, NSDictionary<NSNumber *, UIView *> *viewRegistry) {
+    RCTSelectableTextView *view = (RCTSelectableTextView *)viewRegistry[reactTag];
+
+    // 只对 SelectableText 实例执行清理命令，避免错误 tag 影响其他原生视图。
+    if (![view isKindOfClass:[RCTSelectableTextView class]]) {
+      return;
+    }
+
+    [view clearTextSelection];
+  }];
+}
+
+RCT_EXPORT_METHOD(copyRange : (nonnull NSNumber *)reactTag start : (NSInteger)start end : (NSInteger)end)
+{
+  [self.bridge.uiManager addUIBlock:^(__unused RCTUIManager *uiManager, NSDictionary<NSNumber *, UIView *> *viewRegistry) {
+    RCTSelectableTextView *view = (RCTSelectableTextView *)viewRegistry[reactTag];
+
+    // 只对 SelectableText 实例执行复制命令，避免错误 tag 影响其他原生视图。
+    if (![view isKindOfClass:[RCTSelectableTextView class]]) {
+      return;
+    }
+
+    [view copyTextRangeWithStart:start end:end];
+  }];
+}
 
 @end

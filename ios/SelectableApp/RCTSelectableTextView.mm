@@ -6,13 +6,15 @@
 // 记录当前交互中的 SelectableText，用于切换文本块时清理上一个 UITextView 保留的 selectedRange。
 static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
 
-@interface RCTSelectableTextView () <UITextViewDelegate>
+@interface RCTSelectableTextView () <UITextViewDelegate, UIEditMenuInteractionDelegate>
 
 @end
 
 @implementation RCTSelectableTextView {
   NSArray<UIView *> *_Nullable _descendantViews;
   BOOL _rnSelectable;
+  UILongPressGestureRecognizer *_paragraphLongPressGestureRecognizer;
+  UIEditMenuInteraction *_selectionEditMenuInteraction API_AVAILABLE(ios(16.0));
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -24,6 +26,12 @@ static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
     self.scrollEnabled = NO;
     self.delegate = self;
     self.dataDetectorTypes = UIDataDetectorTypeNone;
+
+    // RN 菜单模式使用自定义长按，只负责命中文本并把段落信息回传给 JS。
+    _paragraphLongPressGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                                                         action:@selector(handleParagraphLongPress:)];
+    _paragraphLongPressGestureRecognizer.cancelsTouchesInView = NO;
+    [self addGestureRecognizer:_paragraphLongPressGestureRecognizer];
 
     // 布局一致性：消除 UITextView 默认的内边距
     self.textContainerInset = UIEdgeInsetsZero;
@@ -45,6 +53,8 @@ static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
     _showSystemMenuItems = YES;
     // 默认菜单点击后保留选区，调用方可通过 clearSelectionOnMenuAction 开启自动清空。
     _clearSelectionOnMenuAction = NO;
+    // 默认使用 UITextView 原生选择模式，业务菜单模式需要显式开启。
+    _selectionMode = @"default";
   }
   return self;
 }
@@ -71,6 +81,11 @@ static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
   if (self.selectedRange.location != NSNotFound && self.selectedRange.length > 0) {
     self.selectedRange = NSMakeRange(0, 0);
   }
+
+  // 业务菜单模式清空后回到不可直接选中的初始态，下一次仍需长按菜单触发。
+  if ([self isMenuThenParagraphMode]) {
+    [super setSelectable:NO];
+  }
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -85,12 +100,212 @@ static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
   return [super becomeFirstResponder];
 }
 
+// 判断当前是否使用 RN 菜单后再选段落的业务模式。
+- (BOOL)isMenuThenParagraphMode
+{
+  return [self.selectionMode isEqualToString:@"menuThenParagraph"];
+}
+
+// 根据 selectable 和 selectionMode 同步 UITextView 的真实可选状态。
+- (void)updateNativeSelectableState
+{
+  [super setSelectable:[self isMenuThenParagraphMode] ? NO : _rnSelectable];
+}
+
+// 业务菜单模式下，长按只计算段落和菜单锚点，不让 UITextView 直接进入选区。
+- (void)handleParagraphLongPress:(UILongPressGestureRecognizer *)gesture
+{
+  // 只处理 menuThenParagraph 模式的长按开始，避免干扰默认原生选择模式。
+  if (![self isMenuThenParagraphMode] || gesture.state != UIGestureRecognizerStateBegan) {
+    return;
+  }
+
+  [self markAsActiveSelectableTextView];
+  [self clearTextSelection];
+
+  CGPoint location = [gesture locationInView:self];
+  NSRange paragraphRange = [self paragraphRangeAtPoint:location];
+
+  // 没有命中文本时不弹业务菜单，避免空白区域误触发。
+  if (paragraphRange.location == NSNotFound || paragraphRange.length == 0 || !self.onTextLongPress) {
+    return;
+  }
+
+  NSString *paragraphText = [self.text substringWithRange:paragraphRange];
+  CGPoint pagePoint = [self convertPoint:location toView:nil];
+
+  self.onTextLongPress(@{
+    @"paragraphText" : paragraphText,
+    @"selectionStart" : @(paragraphRange.location),
+    @"selectionEnd" : @(NSMaxRange(paragraphRange)),
+    @"locationX" : @(location.x),
+    @"locationY" : @(location.y),
+    @"pageX" : @(pagePoint.x),
+    @"pageY" : @(pagePoint.y),
+  });
+}
+
+// 将长按坐标映射到字符 index，并按换行符切出所在段落 range。
+- (NSRange)paragraphRangeAtPoint:(CGPoint)point
+{
+  NSString *text = self.text;
+
+  // 文本为空时没有可选段落。
+  if (text.length == 0) {
+    return NSMakeRange(NSNotFound, 0);
+  }
+
+  NSLayoutManager *layoutManager = self.layoutManager;
+  NSTextContainer *textContainer = self.textContainer;
+  [layoutManager ensureLayoutForTextContainer:textContainer];
+
+  CGPoint textContainerPoint = CGPointMake(point.x - self.textContainerInset.left + self.contentOffset.x,
+                                           point.y - self.textContainerInset.top + self.contentOffset.y);
+  CGFloat fraction = 0;
+  NSUInteger charIndex = [layoutManager characterIndexForPoint:textContainerPoint
+                                               inTextContainer:textContainer
+                      fractionOfDistanceBetweenInsertionPoints:&fraction];
+
+  // 点击在文本末尾之后时，按最后一个字符所在段落处理。
+  if (charIndex >= text.length) {
+    charIndex = text.length - 1;
+  }
+
+  NSCharacterSet *newlineSet = [NSCharacterSet newlineCharacterSet];
+  NSInteger start = (NSInteger)charIndex;
+  NSInteger end = (NSInteger)charIndex;
+
+  // 向前找到当前段落的换行边界。
+  while (start > 0) {
+    unichar character = [text characterAtIndex:(NSUInteger)(start - 1)];
+    if ([newlineSet characterIsMember:character]) {
+      break;
+    }
+    start--;
+  }
+
+  // 向后找到当前段落的换行边界。
+  while ((NSUInteger)end < text.length) {
+    unichar character = [text characterAtIndex:(NSUInteger)end];
+    if ([newlineSet characterIsMember:character]) {
+      break;
+    }
+    end++;
+  }
+
+  // 长按命中空行时不返回段落，避免选中零长度内容。
+  if (end <= start) {
+    return NSMakeRange(NSNotFound, 0);
+  }
+
+  return NSMakeRange((NSUInteger)start, (NSUInteger)(end - start));
+}
+
+// JS 点击“选取文本”后调用，临时开启 UITextView 选择能力并选中指定段落。
+- (void)selectTextRangeWithStart:(NSInteger)start end:(NSInteger)end
+{
+  NSRange range = [self clampedRangeWithStart:start end:end];
+
+  // range 无效时不改变当前选区。
+  if (range.location == NSNotFound || range.length == 0) {
+    return;
+  }
+
+  [self markAsActiveSelectableTextView];
+  [super setSelectable:YES];
+  [self becomeFirstResponder];
+  self.selectedRange = range;
+  [self scrollRangeToVisible:range];
+  [self showEditMenuForSelectedRange];
+}
+
+// 程序化设置 selectedRange 后，主动显示系统选中文本菜单。
+- (void)showEditMenuForSelectedRange
+{
+  UITextRange *selectedTextRange = self.selectedTextRange;
+
+  // 没有有效 selectedTextRange 时无法计算菜单锚点。
+  if (selectedTextRange == nil || selectedTextRange.empty) {
+    return;
+  }
+
+  CGRect targetRect = [self firstRectForRange:selectedTextRange];
+
+  // firstRectForRange 可能返回无效 rect，无法定位菜单时不展示。
+  if (CGRectIsNull(targetRect) || CGRectIsEmpty(targetRect) || CGRectIsInfinite(targetRect)) {
+    return;
+  }
+
+  if (@available(iOS 16.0, *)) {
+    if (_selectionEditMenuInteraction == nil) {
+      _selectionEditMenuInteraction = [[UIEditMenuInteraction alloc] initWithDelegate:self];
+      [self addInteraction:_selectionEditMenuInteraction];
+    }
+    UIEditMenuConfiguration *configuration =
+        [UIEditMenuConfiguration configurationWithIdentifier:nil sourcePoint:CGPointMake(CGRectGetMidX(targetRect), CGRectGetMinY(targetRect))];
+    [_selectionEditMenuInteraction presentEditMenuWithConfiguration:configuration];
+    return;
+  }
+
+  UIMenuController *menuController = [UIMenuController sharedMenuController];
+  [menuController showMenuFromView:self rect:targetRect];
+}
+
+// JS 点击“复制”后调用，复制指定段落到系统剪贴板。
+- (void)copyTextRangeWithStart:(NSInteger)start end:(NSInteger)end
+{
+  NSRange range = [self clampedRangeWithStart:start end:end];
+
+  // range 无效时不写剪贴板。
+  if (range.location == NSNotFound || range.length == 0) {
+    return;
+  }
+
+  [UIPasteboard generalPasteboard].string = [self.text substringWithRange:range];
+}
+
+// 将 JS 传入的 start/end 裁剪到当前文本范围内，避免越界访问。
+- (NSRange)clampedRangeWithStart:(NSInteger)start end:(NSInteger)end
+{
+  NSUInteger textLength = self.text.length;
+
+  // 起止位置非法或反向时返回无效 range。
+  if (start < 0 || end <= start || textLength == 0) {
+    return NSMakeRange(NSNotFound, 0);
+  }
+
+  NSUInteger clampedStart = MIN((NSUInteger)start, textLength);
+  NSUInteger clampedEnd = MIN((NSUInteger)end, textLength);
+
+  // 裁剪后没有实际长度时返回无效 range。
+  if (clampedEnd <= clampedStart) {
+    return NSMakeRange(NSNotFound, 0);
+  }
+
+  return NSMakeRange(clampedStart, clampedEnd - clampedStart);
+}
+
 #pragma mark - Custom Edit Menu
 
 // 构建 iOS 16+ 文本选中菜单，根据 showSystemMenuItems 决定是否保留系统 suggestedActions。
 - (UIMenu *)textView:(UITextView *)textView
     editMenuForTextInRange:(NSRange)range
           suggestedActions:(NSArray<UIMenuElement *> *)suggestedActions API_AVAILABLE(ios(16.0))
+{
+  return [self menuWithSuggestedActions:suggestedActions selectedRange:range];
+}
+
+// 程序化展示 UIEditMenuInteraction 时也复用同一套自定义菜单逻辑。
+- (UIMenu *)editMenuInteraction:(UIEditMenuInteraction *)interaction
+           menuForConfiguration:(UIEditMenuConfiguration *)configuration
+               suggestedActions:(NSArray<UIMenuElement *> *)suggestedActions API_AVAILABLE(ios(16.0))
+{
+  return [self menuWithSuggestedActions:suggestedActions selectedRange:self.selectedRange];
+}
+
+// 统一组装系统菜单项和 JS 传入的自定义菜单项，避免不同入口菜单表现不一致。
+- (UIMenu *)menuWithSuggestedActions:(NSArray<UIMenuElement *> *)suggestedActions
+                       selectedRange:(NSRange)selectedRange API_AVAILABLE(ios(16.0))
 {
   NSMutableArray<UIMenuElement *> *children =
       self.showSystemMenuItems ? [suggestedActions mutableCopy] : [NSMutableArray new];
@@ -100,7 +315,7 @@ static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
     children = [NSMutableArray new];
   }
 
-  NSArray<UIMenuElement *> *customActions = [self customMenuActionsForSelectedRange:range];
+  NSArray<UIMenuElement *> *customActions = [self customMenuActionsForSelectedRange:selectedRange];
 
   // 如果 JS 传入了可用菜单项，则把自定义项追加到当前菜单列表后面。
   if (customActions.count > 0) {
@@ -196,13 +411,21 @@ static __weak RCTSelectableTextView *RCTActiveSelectableTextView = nil;
     return;
   }
   _rnSelectable = selectable;
-  [super setSelectable:selectable];
+  [self updateNativeSelectableState];
 }
 
 // 返回 RN 记录的 selectable 状态，和 UITextView 的 isSelectable getter 保持一致。
 - (BOOL)isSelectable
 {
   return _rnSelectable;
+}
+
+- (void)setSelectionMode:(NSString *)selectionMode
+{
+  // selectionMode 为空时回到默认原生选择模式。
+  _selectionMode = selectionMode ?: @"default";
+  [self clearTextSelection];
+  [self updateNativeSelectableState];
 }
 
 - (void)setTextStorage:(NSTextStorage *)textStorage
