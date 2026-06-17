@@ -1,0 +1,217 @@
+diff --git a/node_modules/react-native/Libraries/Text/Text/RCTTextView.mm b/node_modules/react-native/Libraries/Text/Text/RCTTextView.mm
+index 47632aa..375191a 100644
+--- a/node_modules/react-native/Libraries/Text/Text/RCTTextView.mm
++++ b/node_modules/react-native/Libraries/Text/Text/RCTTextView.mm
+@@ -16,7 +16,9 @@
+ 
+ #import <QuartzCore/QuartzCore.h>
+ 
+-@interface RCTTextView () <UIEditMenuInteractionDelegate>
++@interface RCTTextView () <UIEditMenuInteractionDelegate> {
++  NSRange _selectedRange;
++}
+ 
+ @property (nonatomic, nullable) UIEditMenuInteraction *editMenuInteraction API_AVAILABLE(ios(16.0));
+ 
+@@ -24,6 +26,7 @@
+ 
+ @implementation RCTTextView {
+   CAShapeLayer *_highlightLayer;
++  UIView *_highlightView;
+   UILongPressGestureRecognizer *_longPressGestureRecognizer;
+ 
+   NSArray<UIView *> *_Nullable _descendantViews;
+@@ -34,6 +37,7 @@
+ - (instancetype)initWithFrame:(CGRect)frame
+ {
+   if (self = [super initWithFrame:frame]) {
++    _selectedRange = NSMakeRange(NSNotFound, 0);
+     self.isAccessibilityElement = YES;
+     self.accessibilityTraits |= UIAccessibilityTraitStaticText;
+     self.opaque = NO;
+@@ -133,8 +137,8 @@
+                 }
+ 
+                 [layoutManager
+-                    enumerateEnclosingRectsForGlyphRange:range
+-                                withinSelectedGlyphRange:range
++                    enumerateEnclosingRectsForGlyphRange:[layoutManager glyphRangeForCharacterRange:range actualCharacterRange:NULL]
++                                withinSelectedGlyphRange:[layoutManager glyphRangeForCharacterRange:range actualCharacterRange:NULL]
+                                          inTextContainer:textContainer
+                                               usingBlock:^(CGRect enclosingRect, __unused BOOL *anotherStop) {
+                                                 UIBezierPath *path = [UIBezierPath
+@@ -151,7 +155,9 @@
+   if (highlightPath) {
+     if (!_highlightLayer) {
+       _highlightLayer = [CAShapeLayer layer];
+-      _highlightLayer.fillColor = [UIColor colorWithWhite:0 alpha:0.25].CGColor;
++      _highlightLayer.fillColor = [UIColor colorWithRed:0 green:0.478 blue:1 alpha:0.3].CGColor;
++	      _highlightLayer.strokeColor = [UIColor colorWithRed:0 green:0.478 blue:1 alpha:0.8].CGColor;
++	      _highlightLayer.lineWidth = 1.0;
+       [self.layer addSublayer:_highlightLayer];
+     }
+     _highlightLayer.position = _contentFrame.origin;
+@@ -222,6 +228,11 @@
+   if (@available(iOS 16.0, *)) {
+     _editMenuInteraction = [[UIEditMenuInteraction alloc] initWithDelegate:self];
+     [self addInteraction:_editMenuInteraction];
++  } else {
++    [[NSNotificationCenter defaultCenter] addObserver:self
++                                             selector:@selector(clearSelection)
++                                                 name:UIMenuControllerDidHideMenuNotification
++                                               object:nil];
+   }
+ 
+   [self addGestureRecognizer:_longPressGestureRecognizer];
+@@ -234,14 +245,108 @@
+   if (@available(iOS 16.0, *)) {
+     [self removeInteraction:_editMenuInteraction];
+     _editMenuInteraction = nil;
++  } else {
++    [[NSNotificationCenter defaultCenter] removeObserver:self
++                                                    name:UIMenuControllerDidHideMenuNotification
++                                                  object:nil];
+   }
+   _longPressGestureRecognizer = nil;
++  [self clearSelection];
++}
++
++- (void)clearSelection
++{
++  [self clearSelectionLayer];
++}
++
++#pragma mark - UIEditMenuInteractionDelegate
++
++- (void)editMenuInteraction:(UIEditMenuInteraction *)interaction
++    willDismissMenuForConfiguration:(UIEditMenuConfiguration *)configuration
++                           animator:(id<UIEditMenuInteractionAnimating>)animator API_AVAILABLE(ios(16.0))
++{
++  [self clearSelection];
+ }
+ 
+ - (void)handleLongPress:(UILongPressGestureRecognizer *)gesture
+ {
++  if (gesture.state != UIGestureRecognizerStateBegan) {
++    return;
++  }
++
++  // DEBUG: 红色方块验证 handleLongPress 是否被调用
++  UIView *debugView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 40, 40)];
++  debugView.backgroundColor = [UIColor redColor];
++  debugView.userInteractionEnabled = NO;
++  debugView.tag = 9999;
++  [self addSubview:debugView];
++
++  CGPoint location = [gesture locationInView:self];
++  NSLayoutManager *layoutManager = _textStorage.layoutManagers.firstObject;
++  NSTextContainer *textContainer = layoutManager.textContainers.firstObject;
++
++  if (layoutManager != nil && textContainer != nil && _textStorage.length > 0) {
++    CGFloat fraction;
++    NSUInteger charIndex = [layoutManager characterIndexForPoint:location
++                                                  inTextContainer:textContainer
++                                 fractionOfDistanceBetweenInsertionPoints:&fraction];
++
++    if (charIndex < _textStorage.length) {
++      // 清除旧的高亮
++      [self clearSelectionLayer];
++
++      // 使用 CFStringTokenizer 找到单词边界
++      NSString *text = _textStorage.string;
++      CFRange tokenRange = CFRangeMake(0, text.length);
++      CFLocaleRef locale = CFLocaleCopyCurrent();
++      CFStringTokenizerRef tokenizer = CFStringTokenizerCreate(
++          kCFAllocatorDefault, (__bridge CFStringRef)text, tokenRange, kCFStringTokenizerUnitWord, locale);
++      CFRelease(locale);
++
++      CFStringTokenizerTokenType tokenType = CFStringTokenizerGoToTokenAtIndex(tokenizer, charIndex);
++      if (tokenType != kCFStringTokenizerTokenNone) {
++        CFRange wordCFRange = CFStringTokenizerGetCurrentTokenRange(tokenizer);
++        _selectedRange = NSMakeRange(wordCFRange.location, wordCFRange.length);
++      } else {
++        _selectedRange = NSMakeRange(charIndex, 1);
++      }
++      CFRelease(tokenizer);
++
++      // 使用 NSLayoutManager 计算选中区域 rect，创建 UIView 高亮叠加层
++      if (_selectedRange.location != NSNotFound && _selectedRange.length > 0) {
++        NSRange glyphRange = [layoutManager glyphRangeForCharacterRange:_selectedRange
++                                                   actualCharacterRange:NULL];
++        __block CGRect highlightUnion = CGRectNull;
++        [layoutManager enumerateEnclosingRectsForGlyphRange:glyphRange
++                                    withinSelectedGlyphRange:glyphRange
++                                             inTextContainer:textContainer
++                                                  usingBlock:^(CGRect rect, __unused BOOL *stop) {
++            if (CGRectIsNull(highlightUnion)) {
++              highlightUnion = rect;
++            } else {
++              highlightUnion = CGRectUnion(highlightUnion, rect);
++            }
++          }];
++
++        if (!CGRectIsNull(highlightUnion)) {
++          // 相对于 contentFrame 偏移
++          CGRect highlightFrame = CGRectOffset(CGRectInset(highlightUnion, -2, -2),
++                                               _contentFrame.origin.x,
++                                               _contentFrame.origin.y);
++          UIView *hlView = [[UIView alloc] initWithFrame:highlightFrame];
++          hlView.backgroundColor = [UIColor colorWithRed:1 green:0 blue:0 alpha:0.3];
++          hlView.layer.cornerRadius = 2;
++          hlView.layer.borderColor = [UIColor redColor].CGColor;
++          hlView.layer.borderWidth = 2.0;
++          hlView.userInteractionEnabled = NO;
++          [self addSubview:hlView];
++          _highlightView = hlView;
++        }
++      }
++    }
++  }
++
+   if (@available(iOS 16.0, macCatalyst 16.0, *)) {
+-    CGPoint location = [gesture locationInView:self];
+     UIEditMenuConfiguration *config = [UIEditMenuConfiguration configurationWithIdentifier:nil sourcePoint:location];
+     if (_editMenuInteraction) {
+       [_editMenuInteraction presentEditMenuWithConfiguration:config];
+@@ -257,6 +362,17 @@
+   }
+ }
+ 
++- (void)clearSelectionLayer
++{
++  [_highlightView removeFromSuperview];
++  _highlightView = nil;
++  [_highlightLayer removeFromSuperlayer];
++  _highlightLayer = nil;
++  _selectedRange = NSMakeRange(NSNotFound, 0);
++  // 清除调试方块
++  [[self viewWithTag:9999] removeFromSuperview];
++}
++
+ - (BOOL)canBecomeFirstResponder
+ {
+   return _selectable;
+@@ -273,22 +389,8 @@
+ 
+ - (void)copy:(id)sender
+ {
+-  NSAttributedString *attributedText = _textStorage;
+-
+-  NSMutableDictionary *item = [NSMutableDictionary new];
+-
+-  NSData *rtf = [attributedText dataFromRange:NSMakeRange(0, attributedText.length)
+-                           documentAttributes:@{NSDocumentTypeDocumentAttribute : NSRTFDTextDocumentType}
+-                                        error:nil];
+-
+-  if (rtf) {
+-    [item setObject:rtf forKey:(id)kUTTypeFlatRTFD];
+-  }
+-
+-  [item setObject:attributedText.string forKey:(id)kUTTypeUTF8PlainText];
+-
+   UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
+-  pasteboard.items = @[ item ];
++  pasteboard.string = @"PATCH_OK_复制的是这个字符串则patch已生效";
+ }
+ 
+ @end
