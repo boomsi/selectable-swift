@@ -104,7 +104,6 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
           // 自定义菜单点击后按 prop 决定是否清掉 Android TextView 的当前选区。
           if (clearSelectionOnMenuAction) {
             clearSelection()
-            mode.finish()
           }
 
           return true
@@ -143,7 +142,7 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     }
 
     // menuThenParagraph 未选中时长按只弹 RN 菜单；已有选区时交还 TextView 处理手柄拖动。
-    if (isMenuThenParagraphMode() && !hasActiveSelection()) {
+    if (isMenuThenParagraphMode() && !hasInteractiveSelection()) {
       paragraphLongPressDetector.onTouchEvent(event)
 
       // 手指抬起或取消时释放父级拦截限制，普通上下滑动仍交给 ScrollView 判断。
@@ -157,7 +156,7 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     }
 
     // 当前文本已经有选区时，后续拖动通常是选择手柄移动，不应被 ScrollView 抢走。
-    if (hasActiveSelection()) {
+    if (hasInteractiveSelection()) {
       parent?.requestDisallowInterceptTouchEvent(true)
     }
 
@@ -167,7 +166,7 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     if (
         (event.actionMasked == MotionEvent.ACTION_UP ||
             event.actionMasked == MotionEvent.ACTION_CANCEL) &&
-            !hasActiveSelection()) {
+            !hasInteractiveSelection()) {
       parent?.requestDisallowInterceptTouchEvent(false)
     }
 
@@ -187,14 +186,22 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
 
   // clearSelection 清理 Android TextView 的 Selection span 和当前 ActionMode。
   fun clearSelection() {
+    val actionMode = currentActionMode
+    val hasSelection = hasActiveSelection()
     val currentText = text
+    val selectableText =
+        when {
+          currentText is Spannable -> currentText
+          hasSelection || actionMode != null -> ensureSpannableText()
+          else -> null
+        }
 
-    // 只有 Spannable 文本才包含 Android Selection span，可以被程序化清理。
-    if (currentText is Spannable) {
-      Selection.removeSelection(currentText)
+    // 有真实选区或 ActionMode 时才改 Selection，避免首次长按时无意义 setText 触发布局重建。
+    if (selectableText != null) {
+      Selection.removeSelection(selectableText)
     }
 
-    currentActionMode?.finish()
+    actionMode?.finish()
     clearFocus()
     updateNativeSelectableState()
     parent?.requestDisallowInterceptTouchEvent(false)
@@ -359,7 +366,6 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     }
 
     markAsActiveSelectableTextView()
-    clearSelection()
 
     val paragraphRange = paragraphRangeAtPoint(event.x, event.y)
 
@@ -367,6 +373,8 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     if (paragraphRange == null) {
       return
     }
+
+    clearSelection()
 
     val windowLocation = IntArray(2)
     getLocationInWindow(windowLocation)
@@ -478,6 +486,9 @@ class SelectableTextView(context: Context) : ReactTextView(context) {
     val selectionEnd = Selection.getSelectionEnd(text)
     return selectionStart >= 0 && selectionEnd >= 0 && selectionStart != selectionEnd
   }
+
+  // hasInteractiveSelection 判断当前非空选区是否仍处在系统 ActionMode 交互生命周期里。
+  private fun hasInteractiveSelection(): Boolean = currentActionMode != null && hasActiveSelection()
 
   // markAsActiveSelectableTextView 清理上一个 SelectableText 的残留选区。
   private fun markAsActiveSelectableTextView() {
